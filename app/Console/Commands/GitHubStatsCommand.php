@@ -2,143 +2,212 @@
 
 namespace App\Console\Commands;
 
+use Carbon\Carbon;
 use Illuminate\Console\Command;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Http\Client\Response;
+
 use function Laravel\Prompts\error;
 use function Laravel\Prompts\table;
 use function Laravel\Prompts\text;
 
 class GitHubStatsCommand extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
     protected $signature = 'github:stats';
 
-    /**
-     * The console command description.
-     *
-     * @var string
-     */
-    protected $description = 'Get Github user stats: repos, commits, top language';
+    protected $description = 'Get exact GitHub stats using GraphQL (streaks, commits, calendar)';
 
-    /**
-     * Execute the console command.
-     */
-    public function handle()
+    public function handle(): int
     {
         $username = text(
             label: 'Enter GitHub username',
             placeholder: 'e.g. usenmfon',
-            required: true,
-            // validate: fn (string $value) => strlen($value) < 1 || strlen($value) ? 'Username must be 1-39 characters.' : null
+            required: true
         );
 
-        /** @var Response $response */
-        $response = Http::withHeaders([
-            'Accept' => 'application/vnd.github.v3+json',
-            'User-Agent' => 'Laravel CLI',
-        ])->get("https://api.github.com/users/{$username}");
+        $token = config('services.github.token');
 
-        if($response->failed()) {
-            error("User '{$username}' not found or GitHub API error.");
+        if (! $token) {
+            error('GitHub token not configured. Add GITHUB_TOKEN to .env');
+
             return 1;
         }
 
-        $user = $response->json();
+        $data = $this->fetchContributionData($username, $token);
 
-        info("📊 Stats for GitHub user: {$user['login']}");
+        if (! $data) {
+            error('Could not fetch contribution data.');
 
-        $publicRepos = $user['public_repos'] ?? 0;
-        $this->components->twoColumnDetail('Public Repos', $publicRepos);
+            return 1;
+        }
 
-        $contributionsResponse = Http::get("https://api.github.com/users/{$username}/events/public");
+        info("📊 GitHub Contribution Stats — {$username}");
 
-    if ($contributionsResponse->failed()) {
-        $commitCount = 0;
-    } else {
-        $events = $contributionsResponse->json();
+        $this->components->twoColumnDetail(
+            'Total Contributions (last year)',
+            $data['total']
+        );
 
-        $pushEvents = collect($events)->where('type', 'PushEvent');
-        $commitCount = $pushEvents->count() * 2; // 2 commits per push on average
+        $this->components->twoColumnDetail(
+            'Current Streak',
+            $data['current_streak'].' days'
+        );
+
+        $this->components->twoColumnDetail(
+            'Longest Streak',
+            $data['longest_streak'].' days'
+        );
+
+        $this->displayContributionGraph($data['weeks']);
+
+        $this->displayGitHubStyleHeatmap($data['weeks']);
+
+        return 0;
     }
 
-    $this->components->twoColumnDetail('Total Commits (approx)', $commitCount);
+    protected function fetchContributionData(string $username, string $token): ?array
+    {
+        $query = <<<'GRAPHQL'
+query ($login: String!) {
+  user(login: $login) {
+    contributionsCollection {
+      contributionCalendar {
+        totalContributions
+        weeks {
+          contributionDays {
+            date
+            contributionCount
+          }
+        }
+      }
+    }
+  }
+}
+GRAPHQL;
 
-    // Most used language (same as before)
-    $reposResponse = Http::get("https://api.github.com/users/{$username}/repos?per_page=100");
+        $response = Http::withToken($token)
+            ->post('https://api.github.com/graphql', [
+                'query' => $query,
+                'variables' => ['login' => $username],
+            ]);
 
-    if ($reposResponse->failed()) {
-        $this->components->twoColumnDetail('Top Language', 'Could not fetch repos');
-    } else {
-        $repos = $reposResponse->json();
-        $languageBytes = [];
+        if ($response->failed()) {
+            return null;
+        }
 
-        foreach ($repos as $repo) {
-            if ($repo['language']) {
-                $language = $repo['language'];
-                $languageBytes[$language] = ($languageBytes[$language] ?? 0) + 1;
+        $calendar =
+            $response->json('data.user.contributionsCollection.contributionCalendar');
+
+        $days = collect($calendar['weeks'])
+            ->flatMap(fn ($w) => $w['contributionDays'])
+            ->map(fn ($d) => [
+                'date' => Carbon::parse($d['date']),
+                'count' => $d['contributionCount'],
+            ]);
+
+        return [
+            'total' => $calendar['totalContributions'],
+            'current_streak' => $this->calculateCurrentStreak($days),
+            'longest_streak' => $this->calculateLongestStreak($days),
+            'weeks' => $calendar['weeks'],
+        ];
+    }
+
+    protected function calculateCurrentStreak(Collection $days): int
+    {
+        $streak = 0;
+
+        foreach ($days->sortByDesc('date') as $day) {
+            if ($day['count'] > 0) {
+                $streak++;
+            } else {
+                break;
             }
         }
 
-        if (empty($languageBytes)) {
-            $this->components->twoColumnDetail('Top Language', 'None');
-        } else {
-            arsort($languageBytes);
-            $topLanguage = array_key_first($languageBytes);
-            $this->components->twoColumnDetail('Top Language', $topLanguage);
-        }
+        return $streak;
     }
 
-    // Commit graph (same as before)
-    $this->displayCommitGraph($username);
-
-    return 0;
-    }
-
-    protected function displayCommitGraph(string $username): void
+    protected function calculateLongestStreak(Collection $days): int
     {
-        info('📅 Weekly Commit Activity (last 52 weeks):');
+        $longest = 0;
+        $current = 0;
 
-        $response = Http::get("https://api.github.com/users/{$username}/events/public");
-        if ($response->failed()) {
-            error('Could not fetch commit activity.');
-            return;
+        foreach ($days->sortBy('date') as $day) {
+            if ($day['count'] > 0) {
+                $current++;
+                $longest = max($longest, $current);
+            } else {
+                $current = 0;
+            }
         }
 
-        $events = $response->json();
+        return $longest;
+    }
 
-        // Group by week (YYYY-WW)
-        $weekly = collect($events)
-    ->where('type', 'PushEvent')
-    ->map(fn ($event) => [
-        'week' => now()->parse($event['created_at'])->format('Y-\WW'),
-        'count' => 1, // 1 push ≈ 1 commit for graph
-    ])
-    ->groupBy('week')
-    ->map->sum('count')
-    ->sortKeys()
-    ->take(52);
+    protected function displayContributionGraph(array $weeks): void
+    {
+        info('🟩 Contribution Heatmap (Recent Weeks)');
 
-        if ($weekly->isEmpty()) {
-            $this->info('No recent commits found.');
-            return;
-        }
+        $rows = collect($weeks)
+            ->take(-12) // last 12 weeks
+            ->map(function ($week) {
+                $total = collect($week['contributionDays'])
+                    ->sum('contributionCount');
 
-        // Render simple text graph
-        $max = $weekly->max();
-        $rows = $weekly->map(function ($count, $week) use ($max) {
-            $bar = str_repeat('█', max(1, (int) round($count / max(1, $max) * 20)));
-            return [$week, $count, $bar];
-        })->values()->all();
+                $bar = str_repeat('█', min(20, (int) ($total / 5)));
+
+                return [
+                    Carbon::parse($week['contributionDays'][0]['date'])->format('M d'),
+                    $total,
+                    $bar,
+                ];
+            })
+            ->values()
+            ->all();
 
         table(
-            headers: ['Week', 'Commits', 'Graph'],
+            headers: ['Week', 'Contributions', 'Graph'],
             rows: $rows
         );
     }
 
+    protected function displayGitHubStyleHeatmap(array $weeks): void
+    {
+        info('🟩 GitHub Contribution Graph (Last 12 Weeks)');
+        info('Sun → Sat');
+
+        $levels = [
+            0 => '  ',
+            1 => '░░',
+            5 => '▒▒',
+            10 => '▓▓',
+            20 => '██',
+        ];
+
+        $rows = array_fill(0, 7, []);
+
+        foreach (array_slice($weeks, -12) as $week) {
+            foreach ($week['contributionDays'] as $index => $day) {
+                $count = $day['contributionCount'];
+
+                $block = match (true) {
+                    $count === 0 => $levels[0],
+                    $count < 5 => $levels[1],
+                    $count < 10 => $levels[5],
+                    $count < 20 => $levels[10],
+                    default => $levels[20],
+                };
+
+                $rows[$index][] = $block;
+            }
+        }
+
+        foreach ($rows as $row) {
+            $this->line(implode(' ', $row));
+        }
+
+        $this->newLine();
+        info('Legend:  ░ low   ▒ medium   ▓ high   █ very high');
+    }
 }
