@@ -102,6 +102,11 @@ app/
         └── GithubStatsCommand.php
 ```
 
+## COPY ENV (ADD GITHUB TOKEN)
+```
+cp .env.example .env
+```
+
 ## ⚠️ Limitations
 
 * Commit counts are approximate
